@@ -81,6 +81,13 @@ export class EODPipeline {
   }
 
   /**
+   * Get current session information
+   */
+  getSession() {
+    return this.authService.getSession();
+  }
+
+  /**
    * Parse CSV content directly (utility method)
    */
   static parseCSV(csvContent: string): NormalizedEODData[] {

@@ -1,6 +1,4 @@
 import { CSVParser } from '../src/parsers/csv-parser';
-import { readFileSync } from 'fs';
-import { join } from 'path';
 
 describe('CSVParser', () => {
   const sampleCSVContent = `360,01/07/2025,32.38,33.81,32.38,33.59,1256137
@@ -28,8 +26,8 @@ describe('CSVParser', () => {
     
     expect(normalized[0].date).toBeInstanceOf(Date);
     expect(normalized[0].date.getFullYear()).toBe(2025);
-    expect(normalized[0].date.getMonth()).toBe(0); // January (0-indexed)
-    expect(normalized[0].date.getDate()).toBe(7);
+    expect(normalized[0].date.getMonth()).toBe(6); // July (0-indexed, so 6 = July)
+    expect(normalized[0].date.getDate()).toBe(1); // 01/07/2025 = 1st July 2025
   });
 
   test('should filter by symbols', () => {

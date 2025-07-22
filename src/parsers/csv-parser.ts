@@ -1,4 +1,4 @@
-import { EODData, NormalizedEODData, ParsedCSVRow } from '../types/index.js';
+import { EODData, NormalizedEODData } from '../types/index.js';
 
 export class CSVParser {
   /**
@@ -58,8 +58,8 @@ export class CSVParser {
   }
 
   private static parseDate(dateStr: string): Date {
-    // Convert MM/DD/YYYY to Date object
-    const [month, day, year] = dateStr.split('/').map(num => parseInt(num, 10));
+    // Convert DD/MM/YYYY to Date object (CoolTrader format)
+    const [day, month, year] = dateStr.split('/').map(num => parseInt(num, 10));
     return new Date(year, month - 1, day); // month is 0-indexed in Date constructor
   }
 

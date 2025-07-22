@@ -1,8 +1,6 @@
 import { AuthService } from '../auth/auth-service.js';
 import { CSVParser } from '../parsers/csv-parser.js';
 import { NormalizedEODData, FetchOptions, BulkDataResult } from '../types/index.js';
-import * as yauzl from 'yauzl';
-import { promisify } from 'util';
 
 export class DataFetcher {
   private authService: AuthService;
@@ -12,7 +10,7 @@ export class DataFetcher {
   }
 
   /**
-   * Fetch daily EOD data for a specific date
+   * Fetch daily EOD data for a specific date from CoolTrader
    */
   async fetchDaily(date: string, options?: FetchOptions): Promise<NormalizedEODData[]> {
     await this.authService.ensureAuthenticated();
@@ -20,10 +18,43 @@ export class DataFetcher {
     try {
       const httpClient = this.authService.getHttpClient();
       
-      // This endpoint structure is a placeholder - adapt to your EOD service
-      const response = await httpClient.get(`/data/daily/${date}.csv`, {
-        responseType: 'text'
-      });
+      // Convert date to YYYYMMDD format for CoolTrader
+      const formattedDate = this.formatDateForCoolTrader(date);
+      
+      // Try different possible file locations
+      const possiblePaths = [
+        `/amember/eodfiles/nextday/asx200/${formattedDate}.csv`,
+        `/amember/eodfiles/nextday/${formattedDate}.csv`,
+        `/amember/eodfiles/nextday/all/${formattedDate}.csv`
+      ];
+
+      let response;
+      let foundPath = '';
+
+      for (const path of possiblePaths) {
+        try {
+          response = await httpClient.get(path, {
+            responseType: 'text',
+            timeout: 15000
+          });
+          
+          if (response.status === 200 && response.data.length > 0) {
+            foundPath = path;
+            break;
+          }
+        } catch (error: any) {
+          // Continue to next path if 404
+          if (error.response?.status !== 404) {
+            throw error;
+          }
+        }
+      }
+
+      if (!response || !foundPath) {
+        throw new Error(`No data file found for date ${date} (${formattedDate})`);
+      }
+
+      console.log(`✅ Found data at: ${foundPath}`);
 
       const rawData = CSVParser.parseCSV(response.data);
       let normalizedData = CSVParser.normalize(rawData);
@@ -34,47 +65,108 @@ export class DataFetcher {
       }
 
       return normalizedData;
-    } catch (error) {
-      console.error(`Failed to fetch daily data for ${date}:`, error);
-      throw new Error(`Failed to fetch daily data: ${error}`);
+    } catch (error: any) {
+      console.error(`Failed to fetch daily data for ${date}:`, error.message);
+      throw new Error(`Failed to fetch daily data: ${error.message}`);
     }
   }
 
   /**
-   * Fetch historical data (zip files containing multiple CSV files)
+   * Convert date string to YYYYMMDD format for CoolTrader
+   */
+  private formatDateForCoolTrader(date: string): string {
+    // Handle various input formats
+    let dateObj: Date;
+    
+    if (date.includes('/')) {
+      // MM/DD/YYYY or DD/MM/YYYY format
+      const parts = date.split('/');
+      if (parts.length === 3) {
+        // Assume MM/DD/YYYY for now (can be made configurable)
+        dateObj = new Date(parseInt(parts[2]), parseInt(parts[0]) - 1, parseInt(parts[1]));
+      } else {
+        throw new Error(`Invalid date format: ${date}`);
+      }
+    } else if (date.includes('-')) {
+      // YYYY-MM-DD format
+      dateObj = new Date(date);
+    } else if (date.length === 8) {
+      // YYYYMMDD format - already correct
+      return date;
+    } else {
+      // Try to parse as-is
+      dateObj = new Date(date);
+    }
+
+    if (isNaN(dateObj.getTime())) {
+      throw new Error(`Invalid date: ${date}`);
+    }
+
+    // Format as YYYYMMDD
+    const year = dateObj.getFullYear();
+    const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+    const day = String(dateObj.getDate()).padStart(2, '0');
+    
+    return `${year}${month}${day}`;
+  }
+
+  /**
+   * List available files in the CoolTrader EOD directory
+   */
+  async listAvailableFiles(): Promise<string[]> {
+    await this.authService.ensureAuthenticated();
+    
+    try {
+      const httpClient = this.authService.getHttpClient();
+      const response = await httpClient.get('/amember/eodfiles/nextday/', {
+        responseType: 'text'
+      });
+
+      // Extract CSV file links from HTML
+      const fileLinks = response.data.match(/href="[^"]*\.csv[^"]*"/g) || [];
+      return fileLinks.map((link: string) => {
+        const match = link.match(/href="([^"]*)"/);
+        return match ? match[1] : '';
+      }).filter((link: string) => link.length > 0);
+    } catch (error: any) {
+      console.error('Failed to list available files:', error.message);
+      throw new Error(`Failed to list files: ${error.message}`);
+    }
+  }
+
+  /**
+   * Fetch historical data by fetching individual daily files from /nextday/
+   * Note: This fetches from recent daily files. For older historical data,
+   * users should use the zip files that are available separately.
    */
   async fetchHistorical(startDate: string, endDate: string, options?: FetchOptions): Promise<BulkDataResult> {
     await this.authService.ensureAuthenticated();
     
     try {
-      const httpClient = this.authService.getHttpClient();
-      
-      // Determine which zip files we need based on date range
-      const zipFiles = this.getRequiredZipFiles(startDate, endDate);
-      
+      // Generate date range (only business days)
+      const dates = this.generateDateRange(startDate, endDate);
+      console.log(`📅 Fetching recent daily data for ${dates.length} business days`);
+
       let allData: NormalizedEODData[] = [];
       const symbols = new Set<string>();
+      let successCount = 0;
 
-      for (const zipFile of zipFiles) {
-        const response = await httpClient.get(`/data/historical/${zipFile}`, {
-          responseType: 'arraybuffer'
-        });
-
-        const zipData = await this.extractZipData(Buffer.from(response.data));
-        const normalizedData = CSVParser.normalize(zipData);
-        
-        allData = allData.concat(normalizedData);
-        normalizedData.forEach(item => symbols.add(item.symbol));
+      for (const date of dates) {
+        try {
+          const dailyData = await this.fetchDaily(date, options);
+          allData = allData.concat(dailyData);
+          dailyData.forEach(item => symbols.add(item.symbol));
+          successCount++;
+          console.log(`✅ Fetched ${dailyData.length} records for ${date}`);
+        } catch (error: any) {
+          console.log(`⚠️ No data available for ${date} (likely weekend/holiday or too old)`);
+        }
       }
 
-      // Apply date range filter
-      const startDateObj = new Date(startDate);
-      const endDateObj = new Date(endDate);
-      allData = CSVParser.filterByDateRange(allData, startDateObj, endDateObj);
+      console.log(`📊 Successfully fetched ${successCount}/${dates.length} files`);
 
-      // Apply symbol filter if specified
-      if (options?.symbols && options.symbols.length > 0) {
-        allData = CSVParser.filterBySymbols(allData, options.symbols);
+      if (successCount === 0) {
+        console.log(`💡 Tip: For older historical data, consider using the zip file downloads available separately`);
       }
 
       return {
@@ -88,100 +180,34 @@ export class DataFetcher {
           symbols: Array.from(symbols)
         }
       };
-    } catch (error) {
-      console.error(`Failed to fetch historical data:`, error);
-      throw new Error(`Failed to fetch historical data: ${error}`);
+    } catch (error: any) {
+      console.error(`Failed to fetch historical data:`, error.message);
+      throw new Error(`Failed to fetch historical data: ${error.message}`);
     }
   }
 
   /**
-   * Extract and parse CSV files from zip archive
+   * Generate array of date strings between start and end dates
    */
-  private async extractZipData(zipBuffer: Buffer): Promise<any[]> {
-    return new Promise((resolve, reject) => {
-      const allData: any[] = [];
-
-      yauzl.fromBuffer(zipBuffer, { lazyEntries: true }, (err, zipfile) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-
-        if (!zipfile) {
-          reject(new Error('Failed to open zip file'));
-          return;
-        }
-
-        zipfile.readEntry();
-
-        zipfile.on('entry', (entry) => {
-          if (/\/$/.test(entry.fileName)) {
-            // Directory entry
-            zipfile.readEntry();
-          } else if (entry.fileName.endsWith('.csv')) {
-            // CSV file entry
-            zipfile.openReadStream(entry, (err, readStream) => {
-              if (err) {
-                reject(err);
-                return;
-              }
-
-              if (!readStream) {
-                zipfile.readEntry();
-                return;
-              }
-
-              let csvContent = '';
-              readStream.on('data', (chunk) => {
-                csvContent += chunk.toString();
-              });
-
-              readStream.on('end', () => {
-                const csvData = CSVParser.parseCSV(csvContent);
-                allData.push(...csvData);
-                zipfile.readEntry();
-              });
-
-              readStream.on('error', (err) => {
-                reject(err);
-              });
-            });
-          } else {
-            zipfile.readEntry();
-          }
-        });
-
-        zipfile.on('end', () => {
-          resolve(allData);
-        });
-
-        zipfile.on('error', (err) => {
-          reject(err);
-        });
-      });
-    });
-  }
-
-  /**
-   * Determine which zip files are needed for a date range
-   */
-  private getRequiredZipFiles(startDate: string, endDate: string): string[] {
-    // This is a simplified implementation
-    // You'll need to adapt this based on your EOD service's file naming convention
+  private generateDateRange(startDate: string, endDate: string): string[] {
     const start = new Date(startDate);
     const end = new Date(endDate);
-    const zipFiles: string[] = [];
-
-    const current = new Date(start.getFullYear(), start.getMonth(), 1);
+    const dates: string[] = [];
     
+    const current = new Date(start);
     while (current <= end) {
-      const year = current.getFullYear();
-      const month = String(current.getMonth() + 1).padStart(2, '0');
-      zipFiles.push(`${year}${month}.zip`);
-      
-      current.setMonth(current.getMonth() + 1);
+      // Skip weekends (Saturday = 6, Sunday = 0)
+      if (current.getDay() !== 0 && current.getDay() !== 6) {
+        const year = current.getFullYear();
+        const month = String(current.getMonth() + 1).padStart(2, '0');
+        const day = String(current.getDate()).padStart(2, '0');
+        dates.push(`${year}${month}${day}`);
+      }
+      current.setDate(current.getDate() + 1);
     }
-
-    return zipFiles;
+    
+    return dates;
   }
+
+
 }
